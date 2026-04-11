@@ -20,11 +20,31 @@ public class TCPService {
     private static final int  DISPATCH_POOL = 5;
     private static final long DISPATCH_MS   = 100;
 
+    /**
+     * Tempo (ms) sem despacho após o qual a prioridade de uma ocorrência
+     * é promovida automaticamente (aging), evitando starvation das
+     * ocorrências menos urgentes quando o sistema está sobrecarregado.
+     *
+     * Ex: uma ocorrência prioridade 4 (VERDE) que aguarda mais de
+     * AGING_THRESHOLD_MS sem ser despachada tem sua prioridade efetiva
+     * elevada para 3, depois 2, até ser atendida.
+     */
+    private static final long AGING_THRESHOLD_MS = 30_000; // 30 segundos
+
     private static DatabaseManager db;
 
     private static final Map<String, Node>          registeredNodes = new ConcurrentHashMap<>();
     private static final Map<String, AtomicInteger> nodeLoad        = new ConcurrentHashMap<>();
-    private static final PriorityBlockingQueue<Occurrence> priorityQueue   = new PriorityBlockingQueue<>();
+
+    /**
+     * Fila de prioridade central.
+     * Ordenada pelo compareTo de Occurrence: prioridade 1 sai primeiro.
+     * O aging é aplicado no momento da seleção de candidatos, sem
+     * modificar o campo imutável `priority` — usamos `effectivePriority()`
+     * que leva em conta o tempo de espera.
+     */
+    private static final PriorityBlockingQueue<Occurrence> priorityQueue =
+            new PriorityBlockingQueue<>();
 
     private static final ExecutorService clientPool =
             Executors.newFixedThreadPool(THREAD_POOL, r -> {
@@ -46,9 +66,20 @@ public class TCPService {
     public static void main(String[] args) {
         db = new DatabaseManager();
 
-        registerNode("SAMU_1",  "Ambulância SAMU 1", "AMBULANCE", "localhost", 9100);
-        registerNode("UPA_SUL", "UPA Zona Sul",       "UPA",       "localhost", 9101);
-        registerNode("SAMU_2",  "Ambulância SAMU 2",  "AMBULANCE", "localhost", 9102);
+        /*
+         * Registro dos nós com suas capacidades de prioridade:
+         *
+         *   SAMU_1  → maxPriority=1: atende TUDO, incluindo prioridade 1 (vermelho)
+         *   SAMU_2  → maxPriority=2: atende prioridades 2–5 (laranja a azul)
+         *   UPA_SUL → maxPriority=3: atende prioridades 3–5 (amarelo a azul)
+         *
+         * Assim, paradas cardíacas (prioridade 1) só vão para SAMU_1.
+         * Casos urgentes (prioridade 2) vão para SAMU_1 ou SAMU_2.
+         * Casos não urgentes (prioridade 3-5) podem ir para qualquer nó.
+         */
+        registerNode("SAMU_1",  "Ambulância SAMU 1 – UTI Móvel", "AMBULANCE", "localhost", 9100, 1);
+        registerNode("SAMU_2",  "Ambulância SAMU 2",              "AMBULANCE", "localhost", 9102, 2);
+        registerNode("UPA_SUL", "UPA Zona Sul",                   "UPA",       "localhost", 9101, 3);
 
         for (int i = 0; i < DISPATCH_POOL; i++) {
             dispatchPool.submit(TCPService::dispatchLoop);
@@ -65,7 +96,7 @@ public class TCPService {
         try (ServerSocket server = new ServerSocket(CLIENT_PORT)) {
             server.setReuseAddress(true);
             log("Servidor central iniciado na porta " + CLIENT_PORT);
-            log("Thread pool: " + THREAD_POOL + " workers | Fila de prioridade ativa");
+            log("Distribuição por prioridade ativa | Aging: " + AGING_THRESHOLD_MS + "ms");
 
             while (true) {
                 Socket clientSocket = server.accept();
@@ -93,11 +124,7 @@ public class TCPService {
             }
 
             log("Ocorrência recebida: " + occurrence);
-
-            // ✅ CORRIGIDO: usa sobrecarga com objeto completo,
-            //    que inclui createdAt e receivedAt corretamente
             db.saveOccurrence(occurrence);
-
             priorityQueue.offer(occurrence);
 
             out.writeObject("ACK:" + occurrence.getId());
@@ -128,21 +155,37 @@ public class TCPService {
     }
 
     private static void dispatchToNode(Occurrence occurrence) {
-        List<Node> candidates = selectCandidates(occurrence);
+
+        // Calcula prioridade efetiva considerando aging
+        int effectivePriority = effectivePriority(occurrence);
+
+        if (effectivePriority < occurrence.getPriority()) {
+            log(String.format("AGING aplicado: ocorrência %s promovida P%d → P%d (aguardando %ds)",
+                    occurrence.getId().substring(0, 8),
+                    occurrence.getPriority(),
+                    effectivePriority,
+                    waitSeconds(occurrence)));
+        }
+
+        List<Node> candidates = selectCandidates(occurrence, effectivePriority);
 
         if (candidates.isEmpty()) {
             log("SEM NÓ DISPONÍVEL para " + occurrence.getId().substring(0, 8)
-                    + " — recolocando na fila");
+                    + " (P" + effectivePriority + ") — recolocando na fila");
             occurrence.setStatus(Status.PENDING);
             priorityQueue.offer(occurrence);
             try { Thread.sleep(DISPATCH_MS); } catch (InterruptedException ignored) {}
             return;
         }
 
-        Node target = roundRobin(candidates);
+        Node target = leastLoaded(candidates);
 
-        log("Despachando " + occurrence.getId().substring(0, 8)
-                + " → " + target.id + " (carga atual: " + nodeLoad.get(target.id).get() + ")");
+        log(String.format("Despachando %s (P%d efetivo) → %s [carga=%d | maxP=%d]",
+                occurrence.getId().substring(0, 8),
+                effectivePriority,
+                target.id,
+                nodeLoad.get(target.id).get(),
+                target.getMaxPriority()));
 
         Timestamp dispatchedAt = new Timestamp(System.currentTimeMillis());
         occurrence.setAssignedNode(target.id);
@@ -153,7 +196,6 @@ public class TCPService {
         Timestamp ackAt = new Timestamp(System.currentTimeMillis());
 
         if (acked) {
-            // ✅ CORRIGIDO: decrementa carga após confirmar ACK
             nodeLoad.get(target.id).decrementAndGet();
             occurrence.setStatus(Status.ACKNOWLEDGED);
             db.updateOccurrenceStatus(occurrence.getId(), Status.ACKNOWLEDGED.name());
@@ -162,7 +204,6 @@ public class TCPService {
             log("ACK confirmado de " + target.id + " em " + responseMs + "ms");
         } else {
             log("FALHA no nó " + target.id + " — marcando OFFLINE, recolocando ocorrência");
-            // ✅ CORRIGIDO: usa volatile field via método dedicado
             markNodeUnavailable(target.id);
             occurrence.setStatus(Status.PENDING);
             occurrence.setAssignedNode(null);
@@ -171,18 +212,94 @@ public class TCPService {
     }
 
     // ---------------------------------------------------------------
+    // Aging — eleva prioridade de ocorrências com longa espera
+    // ---------------------------------------------------------------
+
+    /**
+     * Calcula a prioridade efetiva de uma ocorrência levando em conta
+     * o tempo que ela está na fila (aging).
+     *
+     * A cada AGING_THRESHOLD_MS de espera, a prioridade sobe 1 nível
+     * (valor diminui 1), até o máximo de prioridade 1 (crítico).
+     *
+     * Exemplos com AGING_THRESHOLD_MS = 30s:
+     *   - P5, esperando 0s  → efetiva P5
+     *   - P5, esperando 35s → efetiva P4
+     *   - P5, esperando 65s → efetiva P3
+     *   - P3, esperando 35s → efetiva P2
+     */
+    private static int effectivePriority(Occurrence occurrence) {
+        long waitMs = System.currentTimeMillis() - occurrence.getCreatedAt().getTime();
+        int promotions = (int) (waitMs / AGING_THRESHOLD_MS);
+        return Math.max(1, occurrence.getPriority() - promotions);
+    }
+
+    private static long waitSeconds(Occurrence occurrence) {
+        return (System.currentTimeMillis() - occurrence.getCreatedAt().getTime()) / 1000;
+    }
+
+    // ---------------------------------------------------------------
+    // Seleção de candidatos por prioridade
+    // ---------------------------------------------------------------
+
+    /**
+     * Seleciona os nós aptos a atender uma ocorrência, considerando:
+     *
+     * 1. Disponibilidade (online)
+     * 2. Capacidade de prioridade: node.canHandle(effectivePriority)
+     *    — um nó com maxPriority=3 NÃO recebe ocorrências P1 ou P2
+     * 3. Preferência por tipo para emergências graves:
+     *    CARDIAC_ARREST, STROKE e TRAUMA preferem AMBULANCE
+     *
+     * Resultado: lista ordenada com nós preferidos no início.
+     */
+    private static List<Node> selectCandidates(Occurrence occurrence, int effectivePriority) {
+        List<Node> preferred = new ArrayList<>();
+        List<Node> fallback  = new ArrayList<>();
+
+        boolean preferAmbulance =
+                occurrence.getType() == Occurrence.Type.CARDIAC_ARREST
+                || occurrence.getType() == Occurrence.Type.STROKE
+                || occurrence.getType() == Occurrence.Type.TRAUMA;
+
+        for (Node node : registeredNodes.values()) {
+
+            // Nó offline → descarta
+            if (!node.available) continue;
+
+            // Nó não tem capacidade para esta prioridade → descarta
+            if (!node.canHandle(effectivePriority)) continue;
+
+            if (preferAmbulance && node.type.equals("AMBULANCE")) {
+                preferred.add(node);   // ambulâncias na frente para emergências graves
+            } else {
+                fallback.add(node);
+            }
+        }
+
+        // Une: nós preferidos primeiro, depois os demais
+        List<Node> result = new ArrayList<>(preferred);
+        result.addAll(fallback);
+        return result;
+    }
+
+    // ---------------------------------------------------------------
+    // Balanceamento: menor carga entre os candidatos
+    // ---------------------------------------------------------------
+    private static Node leastLoaded(List<Node> candidates) {
+        return candidates.stream()
+                .min(Comparator.comparingInt(n -> nodeLoad.get(n.id).get()))
+                .orElse(candidates.get(0));
+    }
+
+    // ---------------------------------------------------------------
     // Comunicação com nós
     // ---------------------------------------------------------------
     private static boolean sendToNode(Node node, Occurrence occurrence) {
-        try (
-            // ✅ CORRIGIDO: socket e streams todos no try-with-resources
-            Socket socket            = new Socket();
-            // streams declarados após connect() abaixo — ver bloco interno
-        ) {
+        try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(node.host, node.port), 3000);
             socket.setSoTimeout(5000);
 
-            // streams criados após connect para evitar bloqueio prematuro
             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
             ObjectInputStream  in  = new ObjectInputStream(socket.getInputStream());
 
@@ -190,10 +307,8 @@ public class TCPService {
             out.flush();
 
             Object response = in.readObject();
-
             boolean success = response instanceof String s && s.startsWith("ACK:");
 
-            // ✅ CORRIGIDO: só incrementa carga se realmente obteve ACK
             if (success) {
                 nodeLoad.get(node.id).incrementAndGet();
             }
@@ -207,41 +322,20 @@ public class TCPService {
     }
 
     // ---------------------------------------------------------------
-    // Seleção de nós
-    // ---------------------------------------------------------------
-    private static List<Node> selectCandidates(Occurrence occurrence) {
-        List<Node> result = new ArrayList<>();
-
-        for (Node node : registeredNodes.values()) {
-            // ✅ CORRIGIDO: leitura via volatile — thread-safe
-            if (!node.available) continue;
-
-            boolean preferAmbulance =
-                    occurrence.getType() == Occurrence.Type.CARDIAC_ARREST
-                    || occurrence.getType() == Occurrence.Type.STROKE
-                    || occurrence.getType() == Occurrence.Type.TRAUMA;
-
-            if (preferAmbulance && node.type.equals("AMBULANCE")) {
-                result.add(0, node);
-            } else {
-                result.add(node);
-            }
-        }
-        return result;
-    }
-
-    private static Node roundRobin(List<Node> candidates) {
-        return candidates.stream()
-                .min(Comparator.comparingInt(n -> nodeLoad.get(n.id).get()))
-                .orElse(candidates.get(0));
-    }
-
-    // ---------------------------------------------------------------
     // Gerenciamento de nós
     // ---------------------------------------------------------------
+
+    /** Registra um nó sem maxPriority — atende todas as prioridades. */
     public static void registerNode(String id, String name,
                                      String type, String host, int port) {
-        Node node = new Node(id, name, type, host, port);
+        registerNode(id, name, type, host, port, 5);
+    }
+
+    /** Registra um nó com capacidade de prioridade definida. */
+    public static void registerNode(String id, String name,
+                                     String type, String host, int port,
+                                     int maxPriority) {
+        Node node = new Node(id, name, type, host, port, maxPriority);
         registeredNodes.put(id, node);
         nodeLoad.put(id, new AtomicInteger(0));
         db.registerNode(id, name, type);
@@ -251,7 +345,7 @@ public class TCPService {
     private static void markNodeUnavailable(String nodeId) {
         Node node = registeredNodes.get(nodeId);
         if (node != null) {
-            node.available = false;          // volatile — visível a todas as threads
+            node.available = false;
             db.markNodeOffline(nodeId);
             log("Nó marcado OFFLINE: " + nodeId);
         }
@@ -261,42 +355,41 @@ public class TCPService {
         Node node = registeredNodes.get(nodeId);
         if (node != null) {
             node.available = true;
-            nodeLoad.put(nodeId, new AtomicInteger(0));  // reseta carga
+            nodeLoad.put(nodeId, new AtomicInteger(0));
             db.updateHeartbeat(nodeId);
             log("Nó reativado: " + nodeId);
         }
     }
 
     // ---------------------------------------------------------------
-// Receptor UDP de Heartbeat (porta 9001)
-// ---------------------------------------------------------------
-private static void startHeartbeatReceiver() {
-    Thread udpThread = new Thread(() -> {
-        try (DatagramSocket udpSocket = new DatagramSocket(9001)) {
-            udpSocket.setReuseAddress(true);
-            log("Receptor de heartbeat UDP iniciado na porta 9001");
+    // Receptor UDP de Heartbeat (porta 9001)
+    // ---------------------------------------------------------------
+    private static void startHeartbeatReceiver() {
+        Thread udpThread = new Thread(() -> {
+            try (DatagramSocket udpSocket = new DatagramSocket(9001)) {
+                udpSocket.setReuseAddress(true);
+                log("Receptor de heartbeat UDP iniciado na porta 9001");
 
-            byte[] buffer = new byte[256];
+                byte[] buffer = new byte[256];
 
-            while (!Thread.currentThread().isInterrupted()) {
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                udpSocket.receive(packet); // bloqueia até chegar pacote
+                while (!Thread.currentThread().isInterrupted()) {
+                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                    udpSocket.receive(packet);
 
-                String message = new String(packet.getData(), 0, packet.getLength()).trim();
-                handleHeartbeat(message, packet.getAddress().getHostAddress());
+                    String message = new String(packet.getData(), 0, packet.getLength()).trim();
+                    handleHeartbeat(message, packet.getAddress().getHostAddress());
+                }
+
+            } catch (Exception e) {
+                log("ERRO no receptor UDP: " + e.getMessage());
             }
+        }, "heartbeat-receiver");
 
-        } catch (Exception e) {
-            log("ERRO no receptor UDP: " + e.getMessage());
-        }
-    }, "heartbeat-receiver");
-
-    udpThread.setDaemon(true);
-    udpThread.start();
-}
+        udpThread.setDaemon(true);
+        udpThread.start();
+    }
 
     private static void handleHeartbeat(String message, String fromIp) {
-        // Formato esperado: "HB:<nodeId>"
         if (!message.startsWith("HB:")) {
             log("Heartbeat malformado de " + fromIp + ": " + message);
             return;
@@ -312,7 +405,6 @@ private static void startHeartbeatReceiver() {
 
         db.updateHeartbeat(nodeId);
 
-        // Se o nó estava offline, reativa automaticamente
         if (!node.available) {
             markNodeAvailable(nodeId);
             log("Nó REATIVADO via heartbeat: " + nodeId + " (" + fromIp + ")");
