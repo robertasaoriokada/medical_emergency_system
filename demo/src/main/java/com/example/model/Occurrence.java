@@ -19,44 +19,35 @@ public class Occurrence implements Serializable, Comparable<Occurrence> {
 
     private static final long serialVersionUID = 1L;
 
-    // --- Tipos de ocorrência ---
     public enum Type {
-        CARDIAC_ARREST,
-        STROKE,
-        TRAUMA,
-        RESPIRATORY,
-        OBSTETRIC,
-        PSYCHIATRIC,
-        GENERAL
+        CARDIAC_ARREST, STROKE, TRAUMA, RESPIRATORY, OBSTETRIC, PSYCHIATRIC, GENERAL
     }
 
-    // --- Status do ciclo de vida ---
     public enum Status {
-        PENDING,        // recebida, aguardando despacho
-        DISPATCHED,     // despachada para um nó
-        ACKNOWLEDGED,   // nó confirmou recebimento (ACK)
-        COMPLETED,      // atendimento encerrado
-        FAILED          // sem nó disponível / timeout
+        PENDING, DISPATCHED, ACKNOWLEDGED, COMPLETED, FAILED
     }
 
     public enum Color {
-        RED, 
-        ORANGE,
-        YELLOW, 
-        GREEN,
-        BLUE
+        RED, ORANGE, YELLOW, GREEN, BLUE
     }
 
     private final String    id;
-    private final String    origin;       // ex: "POSTO_A", "POSTO_B", "APP_192"
+    private final String    origin;
     private final Type      type;
-    private final int       priority;     // 1 (crítico) → 5 (não urgente)
+    private final int       priority;
     private final String    description;
     private final Timestamp createdAt;
     private final Timestamp receivedAt;
-    private       Color    color;        // VERMELHO, LARANJA, AMARELO, VERDE, AZUL
+    private       Color     color;
     private       Status    status;
-    private       String    assignedNode; // nodeId do nó que atenderá
+    private       String    assignedNode;
+
+    /**
+     * Contador de tentativas de despacho pelo servidor central.
+     * Incrementado em TCPService toda vez que o envio ao nó falha
+     * e a ocorrência volta à fila. Persistido em metrics.retries.
+     */
+    private int dispatchAttempts = 0;
 
     public Occurrence(String origin, Type type, int priority,
                       Color color, String description) {
@@ -66,33 +57,36 @@ public class Occurrence implements Serializable, Comparable<Occurrence> {
         this.priority    = priority;
         this.color       = color;
         this.description = description;
-        this.createdAt = new Timestamp(System.currentTimeMillis()); 
+        this.createdAt   = new Timestamp(System.currentTimeMillis());
         this.receivedAt  = new Timestamp(System.currentTimeMillis());
         this.status      = Status.PENDING;
     }
 
-    // Ordenação pela fila de prioridade: menor número = maior urgência
     @Override
     public int compareTo(Occurrence other) {
         return Integer.compare(this.priority, other.priority);
     }
 
     // --- Getters ---
-    public String    getId()           { return id; }
-    public String    getOrigin()       { return origin; }
-    public Type      getType()         { return type; }
-    public int       getPriority()     { return priority; }
-    public Color    getColor()        { return color; }
-    public String    getDescription()  { return description; }
-    public Timestamp getCreatedAt() { return createdAt; }
-    public Timestamp getReceivedAt()   { return receivedAt; }
-    public Status    getStatus()       { return status; }
-    public String    getAssignedNode() { return assignedNode; }
+    public String    getId()               { return id; }
+    public String    getOrigin()           { return origin; }
+    public Type      getType()             { return type; }
+    public int       getPriority()         { return priority; }
+    public Color     getColor()            { return color; }
+    public String    getDescription()      { return description; }
+    public Timestamp getCreatedAt()        { return createdAt; }
+    public Timestamp getReceivedAt()       { return receivedAt; }
+    public Status    getStatus()           { return status; }
+    public String    getAssignedNode()     { return assignedNode; }
+    public int       getDispatchAttempts() { return dispatchAttempts; }
 
     // --- Setters de estado ---
-    public void setStatus(Status status)           { this.status = status; }
-    public void setColor(Color color)               {this.color = color;}
-    public void setAssignedNode(String assignedNode) { this.assignedNode = assignedNode; }
+    public void setStatus(Status status)              { this.status        = status; }
+    public void setColor(Color color)                 { this.color         = color; }
+    public void setAssignedNode(String assignedNode)  { this.assignedNode  = assignedNode; }
+
+    /** Incrementa o contador de tentativas de despacho. Chamado pelo TCPService. */
+    public void incrementDispatchAttempts()           { this.dispatchAttempts++; }
 
     @Override
     public String toString() {

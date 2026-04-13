@@ -7,14 +7,14 @@ import java.util.Map;
 import com.example.db.DatabaseManager;
 import com.example.model.Node;
 
-public class  Heartbeat {
+public class  HeartbeatReceiver {
     
     private static final int UDP_PORT = 9001;
 
     private final Map<String, Node> registeredNodes;
     private final DatabaseManager   db;
 
-    public Heartbeat(Map<String, Node> registeredNodes, DatabaseManager db) {
+    public HeartbeatReceiver(Map<String, Node> registeredNodes, DatabaseManager db) {
         this.registeredNodes = registeredNodes;
         this.db = db;
     }

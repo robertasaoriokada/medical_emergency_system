@@ -15,10 +15,10 @@ import com.example.db.DatabaseManager;
 
 public class TCPService {
 
-    private static final int  CLIENT_PORT   = 9000; // porta onde clientes (TCPClient) se conectam
-    private static final int  THREAD_POOL   = 10; // máximo de clientes atendidos ao mesmo tempo
-    private static final int  DISPATCH_POOL = 5; // threads que ficam despachando ocorrências aos nós
-    private static final long DISPATCH_MS   = 100; // pausa entre tentativas quando nenhum nó está disponível
+    private static final int  CLIENT_PORT        = 9000;  // porta onde clientes (TCPClient) se conectam
+    private static final int  THREAD_POOL        = 10;    // máximo de clientes atendidos ao mesmo tempo
+    private static final int  DISPATCH_POOL      = 5;     // threads que ficam despachando ocorrências aos nós
+    private static final long DISPATCH_MS        = 100;   // pausa entre tentativas quando nenhum nó está disponível
 
     /**
      * Tempo (ms) sem despacho após o qual a prioridade de uma ocorrência
@@ -29,36 +29,41 @@ public class TCPService {
      * AGING_THRESHOLD_MS sem ser despachada tem sua prioridade efetiva
      * elevada para 3, depois 2, até ser atendida.
      */
-    private static final long AGING_THRESHOLD_MS = 30_000; // 30 segundos, a cada 30s na fila, a prioridade sobe 1 nível
+    private static final long AGING_THRESHOLD_MS = 30_000; // a cada 30s na fila, a prioridade sobe 1 nível
 
     private static DatabaseManager db;
 
-    private static final Map<String, Node> registeredNodes = new ConcurrentHashMap<>(); // nodeId → objeto Node
-    private static final Map<String, AtomicInteger> nodeLoad        = new ConcurrentHashMap<>(); // nodeId → quantidade de ocorrências ativas
+    private static final Map<String, Node>          registeredNodes = new ConcurrentHashMap<>(); // nodeId → objeto Node
+    private static final Map<String, AtomicInteger> nodeLoad        = new ConcurrentHashMap<>(); // nodeId → ocorrências ativas
 
     /**
      * Fila de prioridade central.
      * Ordenada pelo compareTo de Occurrence: prioridade 1 sai primeiro.
      * O aging é aplicado no momento da seleção de candidatos, sem
-     * modificar o campo imutável `priority` — usamos `effectivePriority()`
+     * modificar o campo imutável `priority` — usamos effectivePriority()
      * que leva em conta o tempo de espera.
+     *
+     * PriorityBlockingQueue: auto-ordena pelo compareTo de Occurrence e
+     * bloqueia a thread que tenta retirar algo quando está vazia,
+     * sem desperdiçar CPU.
      */
     private static final PriorityBlockingQueue<Occurrence> priorityQueue =
-            new PriorityBlockingQueue<>(); // fila central de ocorrências
-    //Se auto ordena pelo compareTo de Occurence e bloqueia a thread que tenta retirar algo quando está vazia, sem desperdiçar a CPU.
+            new PriorityBlockingQueue<>();
 
-
-    //Em vez de criar uma thread nova para cada conexão, o servidor mantém pools de threads reutilizáveis.
-    //FixedThreadPool cria exatamente N threds e as mantém vivas, se chegarem mais tarefas elas ficam esperando
+    /**
+     * Pool de threads para atender conexões de clientes (TCPClient).
+     * FixedThreadPool cria exatamente N threads e as mantém vivas;
+     * tarefas excedentes ficam na fila interna do pool.
+     * Threads daemon morrem junto com o processo principal.
+     */
     private static final ExecutorService clientPool =
             Executors.newFixedThreadPool(THREAD_POOL, r -> {
                 Thread t = new Thread(r, "client-worker-" + System.nanoTime());
-                t.setDaemon(true); //serve para quando o processo principal encerrar, essas threads morrem automaticamente sem precisar de um shutdown explícito
+                t.setDaemon(true);
                 return t;
             });
 
-
-    //Envia as ocorrência aos nós
+    /** Pool de threads que consomem a fila e despacham ocorrências aos nós. */
     private static final ExecutorService dispatchPool =
             Executors.newFixedThreadPool(DISPATCH_POOL, r -> {
                 Thread t = new Thread(r, "dispatch-worker-" + System.nanoTime());
@@ -66,19 +71,47 @@ public class TCPService {
                 return t;
             });
 
+    // ---------------------------------------------------------------
+    // Entrada
+    // ---------------------------------------------------------------
+    public static void main(String[] args) {
+        db = new DatabaseManager();
+
+        /*
+         * Registro dos nós com suas capacidades de prioridade:
+         *
+         *   SAMU_1  → maxPriority=1: atende TUDO, incluindo prioridade 1 (vermelho)
+         *   SAMU_2  → maxPriority=2: atende prioridades 2–5 (laranja a azul)
+         *   UPA_SUL → maxPriority=3: atende prioridades 3–5 (amarelo a azul)
+         *
+         * Assim, paradas cardíacas (prioridade 1) só vão para SAMU_1.
+         * Casos urgentes (prioridade 2) vão para SAMU_1 ou SAMU_2.
+         * Casos não urgentes (prioridade 3-5) podem ir para qualquer nó.
+         */
+        registerNode("SAMU_1",  "Ambulância SAMU 1 – UTI Móvel", "AMBULANCE", "localhost", 9100, 1);
+        registerNode("SAMU_2",  "Ambulância SAMU 2",              "AMBULANCE", "localhost", 9102, 2);
+        registerNode("UPA_SUL", "UPA Zona Sul",                   "UPA",       "localhost", 9101, 3);
+
+        for (int i = 0; i < DISPATCH_POOL; i++) {
+            dispatchPool.submit(TCPService::dispatchLoop);
+        }
+
+        new HeartbeatReceiver(registeredNodes, db).start(); // sobe antes — thread daemon, não bloqueia
+        startClientServer();                         // bloqueia aqui, por isso fica por último
+    }
 
     // ---------------------------------------------------------------
-    // Servidor de clientes
+    // Servidor de clientes (porta 9000)
     // ---------------------------------------------------------------
     private static void startClientServer() {
-        try (ServerSocket server = new ServerSocket(CLIENT_PORT)) {  // abre a porta e fica escutando
+        try (ServerSocket server = new ServerSocket(CLIENT_PORT)) {
             server.setReuseAddress(true);
             log("Servidor central iniciado na porta " + CLIENT_PORT);
             log("Distribuição por prioridade ativa | Aging: " + AGING_THRESHOLD_MS + "ms");
 
             while (true) {
-                Socket clientSocket = server.accept(); // bloqueia até um cliente conectar → retorna Socket
-                clientPool.submit(() -> handleClient(clientSocket)); // delega o atendimento a uma thread do pool
+                Socket clientSocket = server.accept(); // bloqueia até um cliente conectar
+                clientPool.submit(() -> handleClient(clientSocket)); // delega a uma thread do pool
             }
 
         } catch (IOException e) {
@@ -86,38 +119,62 @@ public class TCPService {
         }
     }
 
-    //Recebe um socket cliente
-    private static void handleClient(Socket clientSocket) {
-        String clientAddr = clientSocket.getInetAddress().getHostAddress(); //pega o endereço de host do cliente
-        log("Cliente conectado: " + clientAddr);
+    /**
+     * Trata uma conexão de cliente recebida.
+     * Lê o objeto Occurrence serializado, persiste no banco,
+     * enfileira na fila de prioridade e devolve ACK ao cliente.
+     *
+     * Ordem OOS → OIS é obrigatória para evitar deadlock no handshake
+     * do ObjectStream: cada lado precisa enviar seu cabeçalho antes
+     * de tentar ler o do outro.
+     */
+private static void handleClient(Socket clientSocket) {
+    String clientAddr = clientSocket.getInetAddress().getHostAddress();
+    log("Cliente conectado: " + clientAddr);
 
-        try (
-            ObjectInputStream  in  = new ObjectInputStream(clientSocket.getInputStream()); //instancia um objeto recuperando-o do stream
-            ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream()) //escreve um objeto no stream
-        ) {
-            Object obj = in.readObject(); //espera por um retorno
+    try (
+        ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream());
+        ObjectInputStream  in  = new ObjectInputStream(clientSocket.getInputStream())
+    ) {
+        out.flush();
 
-            if (!(obj instanceof Occurrence occurrence)) { //verifica se o objeto recebido é um occurence, senão ele escreve no buffer um objeto inválido
-                out.writeObject("ERR:objeto inválido");
-                return;
-            } 
+        Object obj = in.readObject();
 
-            log("Ocorrência recebida: " + occurrence);
-            db.saveOccurrence(occurrence); //salvar no banco a ocorrência
-            priorityQueue.offer(occurrence); //faz a lógica de prioridade
-
-            out.writeObject("ACK:" + occurrence.getId()); //serializa no stream e joga no buffer o Acknowledgement 
-            //simplemente estamos confirmando o recebimento e que o Occurence foi salvo no banco.
-            //no caso nao temos como ver, somente com wireshark e tudo mais
-            log("ACK enviado → " + occurrence.getId().substring(0, 8)); 
-
-        } catch (Exception e) {
-            log("ERRO ao tratar cliente " + clientAddr + ": " + e.getMessage());
-        } finally {
-            try { clientSocket.close(); } catch (IOException ignored) {}
+        if (!(obj instanceof Occurrence occurrence)) {
+            out.writeObject("ERR:objeto inválido");
+            return;
         }
-    }
 
+        log("Ocorrência recebida: " + occurrence);
+
+        // 🔥 DEBUG FORTE
+        System.out.println("[DEBUG] Antes de salvar no banco");
+
+        db.saveOccurrence(occurrence);
+
+        System.out.println("[DEBUG] Depois de salvar no banco");
+
+        priorityQueue.offer(occurrence);
+
+        out.writeObject("ACK:" + occurrence.getId());
+        out.flush(); // 🔥 MUITO IMPORTANTE
+
+        log("ACK enviado → " + occurrence.getId().substring(0, 8));
+
+    } catch (Exception e) {
+        System.err.println("ERRO REAL no servidor:");
+        e.printStackTrace();
+
+        try {
+            ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream());
+            out.writeObject("ERR:" + e.getMessage());
+            out.flush();
+        } catch (Exception ignored) {}
+
+    } finally {
+        try { clientSocket.close(); } catch (IOException ignored) {}
+    }
+}
     // ---------------------------------------------------------------
     // Loop de despacho
     // ---------------------------------------------------------------
@@ -126,7 +183,7 @@ public class TCPService {
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                Occurrence occurrence = priorityQueue.take();
+                Occurrence occurrence = priorityQueue.take(); // bloqueia se vazia
                 dispatchToNode(occurrence);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -161,12 +218,16 @@ public class TCPService {
 
         Node target = leastLoaded(candidates);
 
-        log(String.format("Despachando %s (P%d efetivo) → %s [carga=%d | maxP=%d]",
+        // Incrementa ANTES de tentar — se falhar, o valor já está correto para o próximo ciclo
+        occurrence.incrementDispatchAttempts();
+
+        log(String.format("Despachando %s (P%d efetivo) → %s [carga=%d | maxP=%d | tentativa=%d]",
                 occurrence.getId().substring(0, 8),
                 effectivePriority,
                 target.id,
                 nodeLoad.get(target.id).get(),
-                target.getMaxPriority()));
+                target.getMaxPriority(),
+                occurrence.getDispatchAttempts()));
 
         Timestamp dispatchedAt = new Timestamp(System.currentTimeMillis());
         occurrence.setAssignedNode(target.id);
@@ -177,15 +238,23 @@ public class TCPService {
         Timestamp ackAt = new Timestamp(System.currentTimeMillis());
 
         if (acked) {
-            nodeLoad.get(target.id).decrementAndGet();
             occurrence.setStatus(Status.ACKNOWLEDGED);
             db.updateOccurrenceStatus(occurrence.getId(), Status.ACKNOWLEDGED.name());
+
+            // Marca COMPLETED com timestamp exato do ACK
+            db.updateOccurrenceCompleted(occurrence.getId(), ackAt);
+
             long responseMs = ackAt.getTime() - dispatchedAt.getTime();
-            db.saveMetric(occurrence.getId(), target.id, dispatchedAt, ackAt, responseMs, 0);
-            log("ACK confirmado de " + target.id + " em " + responseMs + "ms");
+            int retries = occurrence.getDispatchAttempts() - 1;
+            db.saveMetric(occurrence.getId(), target.id, dispatchedAt, ackAt, responseMs, retries);
+
+            log(String.format("ACK confirmado de %s em %dms | retries=%d",
+                    target.id, responseMs, retries));
+
         } else {
             log("FALHA no nó " + target.id + " — marcando OFFLINE, recolocando ocorrência");
             markNodeUnavailable(target.id);
+            // nodeLoad já foi decrementado dentro de sendToNode ao lançar exceção
             occurrence.setStatus(Status.PENDING);
             occurrence.setAssignedNode(null);
             priorityQueue.offer(occurrence);
@@ -232,7 +301,7 @@ public class TCPService {
      * 3. Preferência por tipo para emergências graves:
      *    CARDIAC_ARREST, STROKE e TRAUMA preferem AMBULANCE
      *
-     * Resultado: lista ordenada com nós preferidos no início.
+     * Resultado: lista com nós preferidos no início, demais no fim.
      */
     private static List<Node> selectCandidates(Occurrence occurrence, int effectivePriority) {
         List<Node> preferred = new ArrayList<>();
@@ -244,21 +313,16 @@ public class TCPService {
                 || occurrence.getType() == Occurrence.Type.TRAUMA;
 
         for (Node node : registeredNodes.values()) {
-
-            // Nó offline → descarta
             if (!node.available) continue;
-
-            // Nó não tem capacidade para esta prioridade → descarta
             if (!node.canHandle(effectivePriority)) continue;
 
             if (preferAmbulance && node.type.equals("AMBULANCE")) {
-                preferred.add(node);   // ambulâncias na frente para emergências graves
+                preferred.add(node);
             } else {
                 fallback.add(node);
             }
         }
 
-        // Une: nós preferidos primeiro, depois os demais
         List<Node> result = new ArrayList<>(preferred);
         result.addAll(fallback);
         return result;
@@ -276,37 +340,45 @@ public class TCPService {
     // ---------------------------------------------------------------
     // Comunicação com nós
     // ---------------------------------------------------------------
-    private static boolean sendToNode(Node node, Occurrence occurrence) {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(node.host, node.port), 3000);
-            socket.setSoTimeout(5000);
 
-            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-            ObjectInputStream  in  = new ObjectInputStream(socket.getInputStream());
+    /**
+     * Abre uma conexão TCP com o nó, envia a Occurrence serializada
+     * e aguarda o ACK de confirmação.
+     *
+     * ObjectOutputStream ANTES de ObjectInputStream: garante que o
+     * cabeçalho de 4 bytes do OOS seja enviado antes de tentar ler
+     * o cabeçalho do outro lado — evita deadlock mútuo no handshake.
+     */
+private static boolean sendToNode(Node node, Occurrence occurrence) {
+    try (Socket socket = new Socket()) {
+        socket.connect(new InetSocketAddress(node.host, node.port), 3000);
+        socket.setSoTimeout(5000);
 
-            out.writeObject(occurrence);
-            out.flush();
+        // Incrementa carga ANTES de enviar — reserva o slot no nó
+        nodeLoad.get(node.id).incrementAndGet();
 
-            Object response = in.readObject();
-            boolean success = response instanceof String s && s.startsWith("ACK:");
+        ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+        out.flush();
+        ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-            if (success) {
-                nodeLoad.get(node.id).incrementAndGet();
-            }
+        out.writeObject(occurrence);
+        out.flush();
 
-            return success;
+        Object response = in.readObject();
+        return response instanceof String s && s.startsWith("ACK:");
 
-        } catch (Exception e) {
-            log("ERRO ao enviar para nó " + node.id + ": " + e.getMessage());
-            return false;
-        }
+    } catch (Exception e) {
+        // Reverte o incremento se falhou antes do envio
+        nodeLoad.get(node.id).decrementAndGet();
+        log("ERRO ao enviar para nó " + node.id + ": " + e.getMessage());
+        return false;
     }
-
+}
     // ---------------------------------------------------------------
     // Gerenciamento de nós
     // ---------------------------------------------------------------
 
-    /** Registra um nó sem maxPriority — atende todas as prioridades. */
+    /** Registra um nó sem maxPriority — atende todas as prioridades (maxPriority = 5). */
     public static void registerNode(String id, String name,
                                      String type, String host, int port) {
         registerNode(id, name, type, host, port, 5);
@@ -348,22 +420,5 @@ public class TCPService {
     private static void log(String msg) {
         System.out.printf("[SERVIDOR %s] %s%n",
                 new Timestamp(System.currentTimeMillis()), msg);
-    }
-
-
-
-    public static void main(String[] args) {
-        db = new DatabaseManager();
-
-        registerNode("SAMU_1",  "Ambulância SAMU 1 – UTI Móvel", "AMBULANCE", "localhost", 9100, 1);
-        registerNode("SAMU_2",  "Ambulância SAMU 2",              "AMBULANCE", "localhost", 9102, 2);
-        registerNode("UPA_SUL", "UPA Zona Sul",                   "UPA",       "localhost", 9101, 3);
-
-        for (int i = 0; i < DISPATCH_POOL; i++) {
-            dispatchPool.submit(TCPService::dispatchLoop);
-        }
-
-        new Heartbeat(registeredNodes, db).start(); // sobe antes — thread daemon, não bloqueia
-        startClientServer();                         // bloqueia aqui, por isso fica por último
     }
 }
