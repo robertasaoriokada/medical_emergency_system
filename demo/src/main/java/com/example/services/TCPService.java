@@ -147,7 +147,6 @@ private static void handleClient(Socket clientSocket) {
 
         log("Ocorrência recebida: " + occurrence);
 
-        // 🔥 DEBUG FORTE
         System.out.println("[DEBUG] Antes de salvar no banco");
 
         db.saveOccurrence(occurrence);
@@ -157,8 +156,8 @@ private static void handleClient(Socket clientSocket) {
         priorityQueue.offer(occurrence);
 
         out.writeObject("ACK:" + occurrence.getId());
-        out.flush(); // 🔥 MUITO IMPORTANTE
-
+        out.flush();
+        
         log("ACK enviado → " + occurrence.getId().substring(0, 8));
 
     } catch (Exception e) {

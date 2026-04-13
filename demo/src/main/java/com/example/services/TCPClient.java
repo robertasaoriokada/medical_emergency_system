@@ -89,11 +89,26 @@ public class TCPClient {
     public static void main(String[] args) throws Exception {
         TCPClient client = new TCPClient("TESTE");
 
-        Occurrence oc = new Occurrence("Posto 1", Type.CARDIAC_ARREST, 1,
-                Occurrence.Color.RED, "Paciente com dor torácica intensa, 67 anos");
+        Occurrence oc = new Occurrence("Posto 1", Type.CARDIAC_ARREST, 1, Occurrence.Color.RED, "Paciente com dor torácica intensa, 67 anos");
+        Occurrence oc2 = new Occurrence("Posto 2", Type.OBSTETRIC, 4, Occurrence.Color.BLUE, "Paciente grávida com pressão levemente alta, 31 anos");
+        Occurrence oc3 = new Occurrence("Posto 3", Type.TRAUMA, 5, Occurrence.Color.GREEN, "Torceu o pé, 13 anos");
+        Occurrence oc4 = new Occurrence("Posto 1", Type.TRAUMA, 1, Occurrence.Color.RED, "Impalado");
 
         SendResult result = client.send(oc);
+        SendResult result2 = client.send(oc2);
+        SendResult result3 = client.send(oc3);
+        SendResult result4 = client.send(oc4);
+
         System.out.printf("Ocorrência registrada | ID: %s | tentativas: %d%n",
                 result.occurrenceId(), result.attempts());
+        System.out.printf("Ocorrência registrada | ID: %s | tentativas: %d%n",
+                result2.occurrenceId(), result2.attempts());
+        System.out.printf("Ocorrência registrada | ID: %s | tentativas: %d%n",
+                result3.occurrenceId(), result3.attempts());
+        System.out.printf("Ocorrência registrada | ID: %s | tentativas: %d%n",
+                result4.occurrenceId(), result4.attempts());
+
+
+
     }
 }

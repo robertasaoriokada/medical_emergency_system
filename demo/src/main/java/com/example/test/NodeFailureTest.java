@@ -1,5 +1,6 @@
 package com.example.test;
 
+import com.example.db.DatabaseManager;
 import com.example.model.Occurrence;
 import com.example.model.Occurrence.Type;
 import com.example.services.TCPClient;
@@ -34,10 +35,11 @@ import com.example.test.TestUtils.Metrics;
  *   manualmente na Fase 2 (ou use o script StopNode.sh).
  */
 public class NodeFailureTest {
-
+    
+    private static DatabaseManager db = new DatabaseManager();
     private static final String NODE_TO_KILL = "SAMU_1";
     private static final long   PHASE_PAUSE  = 5_000; // pausa entre fases (ms)
-
+    
     public static void main(String[] args) throws Exception {
         System.out.println("=== CENÁRIO 2: Falha e recuperação de nó ===\n");
         Metrics metrics = new Metrics();
@@ -47,7 +49,7 @@ public class NodeFailureTest {
         System.out.println(">>> FASE 1: Sistema normal — 5 ocorrências P1 (críticas)");
         for (int i = 0; i < 5; i++) {
             Occurrence oc = TestUtils.fixedOccurrence("FASE1", 1, Type.CARDIAC_ARREST);
-            sendAndRecord(client, oc, metrics);
+            sendAndRecord(client, oc, metrics, "Fase 1");
             Thread.sleep(500);
         }
 
@@ -63,7 +65,7 @@ public class NodeFailureTest {
         System.out.println("\n    Enviando 3 ocorrências P1 sem SAMU_1...");
         for (int i = 0; i < 3; i++) {
             Occurrence oc = TestUtils.fixedOccurrence("FASE2", 1, Type.STROKE);
-            sendAndRecord(client, oc, metrics);
+            sendAndRecord(client, oc, metrics, "Fase 2");
             Thread.sleep(500);
         }
 
@@ -71,7 +73,7 @@ public class NodeFailureTest {
         System.out.println("\n    Enviando 3 ocorrências P3 (devem ir para UPA_SUL ou SAMU_2)...");
         for (int i = 0; i < 3; i++) {
             Occurrence oc = TestUtils.fixedOccurrence("FASE2", 3, Type.GENERAL);
-            sendAndRecord(client, oc, metrics);
+            sendAndRecord(client, oc, metrics, "Fase 2");
             Thread.sleep(500);
         }
 
@@ -86,24 +88,49 @@ public class NodeFailureTest {
         System.out.println("\n    Enviando 5 ocorrências P1 após recuperação...");
         for (int i = 0; i < 5; i++) {
             Occurrence oc = TestUtils.fixedOccurrence("FASE3", 1, Type.CARDIAC_ARREST);
-            sendAndRecord(client, oc, metrics);
+            sendAndRecord(client, oc, metrics, "Fase 3");
             Thread.sleep(500);
         }
 
         metrics.printReport("Cenário 2 — Falha e recuperação de " + NODE_TO_KILL);
     }
 
-    private static void sendAndRecord(TCPClient client, Occurrence oc, Metrics metrics) {
+    private static void sendAndRecord(TCPClient client, Occurrence oc, Metrics metrics, String phase) {
         long start = System.currentTimeMillis();
+
         try {
             client.send(oc);
+
             long latency = System.currentTimeMillis() - start;
             metrics.recordSuccess(latency);
-            System.out.printf("    ACK em %dms | P%d | %s%n",
+
+            db.saveTestResult(
+                "NODE_FAILURE",
+                phase,
+                oc.getId(),
+                oc.getPriority(),
+                oc.getType().name(),
+                true,
+                latency
+            );
+
+            System.out.printf("ACK em %dms | P%d | %s%n",
                     latency, oc.getPriority(), oc.getType());
+
         } catch (Exception e) {
             metrics.recordFailure();
-            System.out.printf("    FALHA: %s%n", e.getMessage());
+
+            db.saveTestResult(
+                "AGING_TEST",
+                phase,
+                oc.getId(),
+                oc.getPriority(),
+                oc.getType().name(),
+                false,
+                -1
+            );
+
+            System.out.printf("FALHA: %s%n", e.getMessage());
         }
     }
 }

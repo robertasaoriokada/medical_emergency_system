@@ -68,26 +68,39 @@ public class PeakLoadTest {
         metrics.printReport("Cenário 1 — Pico de carga (" + CONCURRENT_CLIENTS + " clientes)");
     }
 
-    private static void runClient(String origin, Metrics metrics) {
-        TCPClient client = new TCPClient(origin);
+private static void runClient(String origin, Metrics metrics) {
+    TCPClient client = new TCPClient(origin);
 
-        for (int i = 0; i < OCCURRENCES_PER_CLIENT; i++) {
-            Occurrence oc = TestUtils.randomOccurrence(origin);
+    for (int i = 0; i < OCCURRENCES_PER_CLIENT; i++) {
+        Occurrence oc = TestUtils.randomOccurrence(origin);
+
+        sendAndRecord(client, oc, metrics, "PEAK_LOAD");
+
+        try { Thread.sleep(SEND_INTERVAL_MS); } catch (InterruptedException ignored) {}
+    }
+}
+    private static void sendAndRecord(
+                TCPClient client,
+                Occurrence oc,
+                Metrics metrics,
+                String phase
+        ) {
             long start = System.currentTimeMillis();
 
             try {
                 client.send(oc);
+
                 long latency = System.currentTimeMillis() - start;
                 metrics.recordSuccess(latency);
-                System.out.printf("[%s] ACK recebido em %dms | P%d | %s%n",
-                        origin, latency, oc.getPriority(), oc.getType());
+
+                System.out.printf("[%s] ACK em %dms | P%d | %s%n",
+                        phase, latency, oc.getPriority(), oc.getType());
+
             } catch (Exception e) {
                 metrics.recordFailure();
-                System.out.printf("[%s] FALHA: %s%n", origin, e.getMessage());
-            }
 
-            // Pequena pausa entre envios para não sobrecarregar o buffer do servidor
-            try { Thread.sleep(SEND_INTERVAL_MS); } catch (InterruptedException ignored) {}
+                System.out.printf("[%s] FALHA: %s%n",
+                        phase, e.getMessage());
+            }
         }
-    }
 }

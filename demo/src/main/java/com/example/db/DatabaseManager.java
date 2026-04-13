@@ -270,6 +270,32 @@ public void saveOccurrence(Occurrence occ) {
         }
     }
 
+
+    public void saveTestResult(String testName, String phase,
+                          String occurrenceId, int priority,
+                          String type, boolean success,
+                          long latencyMs) {
+
+    String sql = """
+        INSERT INTO test_results
+        (test_name, phase, occurrence_id, priority, type, success, latency_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """;
+
+    try (PreparedStatement ps = getConn().prepareStatement(sql)) {
+        ps.setString(1, testName);
+        ps.setString(2, phase);
+        ps.setString(3, occurrenceId);
+        ps.setInt   (4, priority);
+        ps.setString(5, type);
+        ps.setBoolean(6, success);
+        ps.setLong  (7, latencyMs);
+        ps.executeUpdate();
+    } catch (SQLException e) {
+        e.printStackTrace();
+    }
+}
+
     // ---------------------------------------------------------------
     // Encerramento
     // ---------------------------------------------------------------

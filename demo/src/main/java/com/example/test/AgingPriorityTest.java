@@ -1,5 +1,6 @@
 package com.example.test;
 
+import com.example.db.DatabaseManager;
 import com.example.model.Occurrence;
 import com.example.model.Occurrence.Type;
 import com.example.services.TCPClient;
@@ -30,6 +31,7 @@ import com.example.test.TestUtils.Metrics;
  *   Reduzir AGING_THRESHOLD_MS = 5_000 no TCPService para teste rápido.
  */
 public class AgingPriorityTest {
+    private static DatabaseManager db = new DatabaseManager();
 
     // Quantas ocorrências críticas para "saturar" os nós primeiro
     private static final int CRITICAL_BURST = 10;
@@ -51,7 +53,7 @@ public class AgingPriorityTest {
         System.out.println(">>> FASE 1: Enviando " + CRITICAL_BURST + " ocorrências P1 (saturar nós)");
         for (int i = 0; i < CRITICAL_BURST; i++) {
             Occurrence oc = TestUtils.fixedOccurrence("BURST", 1, Type.CARDIAC_ARREST);
-            sendAndRecord(client, oc, metrics);
+            sendAndRecord(client, oc, metrics, "Fase 1");
             Thread.sleep(100);
         }
 
@@ -60,7 +62,7 @@ public class AgingPriorityTest {
         System.out.println("    Observe nos logs do servidor quando elas forem promovidas...\n");
         for (int i = 0; i < LOW_PRIORITY_COUNT; i++) {
             Occurrence oc = TestUtils.fixedOccurrence("AGING_TEST", 5, Type.GENERAL);
-            sendAndRecord(client, oc, metrics);
+            sendAndRecord(client, oc, metrics, "Fase 2");
             Thread.sleep(200);
         }
 
@@ -82,17 +84,42 @@ public class AgingPriorityTest {
         System.out.println("Verifique os logs do TCPService para confirmar as promoções de prioridade.");
     }
 
-    private static void sendAndRecord(TCPClient client, Occurrence oc, Metrics metrics) {
-        long start = System.currentTimeMillis();
-        try {
-            client.send(oc);
-            long latency = System.currentTimeMillis() - start;
-            metrics.recordSuccess(latency);
-            System.out.printf("    ACK em %dms | P%d | %s%n",
-                    latency, oc.getPriority(), oc.getType());
-        } catch (Exception e) {
-            metrics.recordFailure();
-            System.out.printf("    FALHA: %s%n", e.getMessage());
-        }
+private static void sendAndRecord(TCPClient client, Occurrence oc, Metrics metrics, String phase) {
+    long start = System.currentTimeMillis();
+
+    try {
+        client.send(oc);
+
+        long latency = System.currentTimeMillis() - start;
+        metrics.recordSuccess(latency);
+
+        db.saveTestResult(
+            "AGING_TEST",
+            phase,
+            oc.getId(),
+            oc.getPriority(),
+            oc.getType().name(),
+            true,
+            latency
+        );
+
+        System.out.printf("ACK em %dms | P%d | %s%n",
+                latency, oc.getPriority(), oc.getType());
+
+    } catch (Exception e) {
+        metrics.recordFailure();
+
+        db.saveTestResult(
+            "AGING_TEST",
+            phase,
+            oc.getId(),
+            oc.getPriority(),
+            oc.getType().name(),
+            false,
+            -1
+        );
+
+        System.out.printf("FALHA: %s%n", e.getMessage());
     }
+}
 }
