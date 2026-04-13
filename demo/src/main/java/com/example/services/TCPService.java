@@ -15,10 +15,10 @@ import com.example.db.DatabaseManager;
 
 public class TCPService {
 
-    private static final int  CLIENT_PORT   = 9000;
-    private static final int  THREAD_POOL   = 10;
-    private static final int  DISPATCH_POOL = 5;
-    private static final long DISPATCH_MS   = 100;
+    private static final int  CLIENT_PORT   = 9000; // porta onde clientes (TCPClient) se conectam
+    private static final int  THREAD_POOL   = 10; // máximo de clientes atendidos ao mesmo tempo
+    private static final int  DISPATCH_POOL = 5; // threads que ficam despachando ocorrências aos nós
+    private static final long DISPATCH_MS   = 100; // pausa entre tentativas quando nenhum nó está disponível
 
     /**
      * Tempo (ms) sem despacho após o qual a prioridade de uma ocorrência
@@ -29,12 +29,12 @@ public class TCPService {
      * AGING_THRESHOLD_MS sem ser despachada tem sua prioridade efetiva
      * elevada para 3, depois 2, até ser atendida.
      */
-    private static final long AGING_THRESHOLD_MS = 30_000; // 30 segundos
+    private static final long AGING_THRESHOLD_MS = 30_000; // 30 segundos, a cada 30s na fila, a prioridade sobe 1 nível
 
     private static DatabaseManager db;
 
-    private static final Map<String, Node>          registeredNodes = new ConcurrentHashMap<>();
-    private static final Map<String, AtomicInteger> nodeLoad        = new ConcurrentHashMap<>();
+    private static final Map<String, Node> registeredNodes = new ConcurrentHashMap<>(); // nodeId → objeto Node
+    private static final Map<String, AtomicInteger> nodeLoad        = new ConcurrentHashMap<>(); // nodeId → quantidade de ocorrências ativas
 
     /**
      * Fila de prioridade central.
@@ -44,15 +44,21 @@ public class TCPService {
      * que leva em conta o tempo de espera.
      */
     private static final PriorityBlockingQueue<Occurrence> priorityQueue =
-            new PriorityBlockingQueue<>();
+            new PriorityBlockingQueue<>(); // fila central de ocorrências
+    //Se auto ordena pelo compareTo de Occurence e bloqueia a thread que tenta retirar algo quando está vazia, sem desperdiçar a CPU.
 
+
+    //Em vez de criar uma thread nova para cada conexão, o servidor mantém pools de threads reutilizáveis.
+    //FixedThreadPool cria exatamente N threds e as mantém vivas, se chegarem mais tarefas elas ficam esperando
     private static final ExecutorService clientPool =
             Executors.newFixedThreadPool(THREAD_POOL, r -> {
                 Thread t = new Thread(r, "client-worker-" + System.nanoTime());
-                t.setDaemon(true);
+                t.setDaemon(true); //serve para quando o processo principal encerrar, essas threads morrem automaticamente sem precisar de um shutdown explícito
                 return t;
             });
 
+
+    //Envia as ocorrência aos nós
     private static final ExecutorService dispatchPool =
             Executors.newFixedThreadPool(DISPATCH_POOL, r -> {
                 Thread t = new Thread(r, "dispatch-worker-" + System.nanoTime());
@@ -60,47 +66,19 @@ public class TCPService {
                 return t;
             });
 
-    // ---------------------------------------------------------------
-    // Entrada
-    // ---------------------------------------------------------------
-    public static void main(String[] args) {
-        db = new DatabaseManager();
-
-        /*
-         * Registro dos nós com suas capacidades de prioridade:
-         *
-         *   SAMU_1  → maxPriority=1: atende TUDO, incluindo prioridade 1 (vermelho)
-         *   SAMU_2  → maxPriority=2: atende prioridades 2–5 (laranja a azul)
-         *   UPA_SUL → maxPriority=3: atende prioridades 3–5 (amarelo a azul)
-         *
-         * Assim, paradas cardíacas (prioridade 1) só vão para SAMU_1.
-         * Casos urgentes (prioridade 2) vão para SAMU_1 ou SAMU_2.
-         * Casos não urgentes (prioridade 3-5) podem ir para qualquer nó.
-         */
-        registerNode("SAMU_1",  "Ambulância SAMU 1 – UTI Móvel", "AMBULANCE", "localhost", 9100, 1);
-        registerNode("SAMU_2",  "Ambulância SAMU 2",              "AMBULANCE", "localhost", 9102, 2);
-        registerNode("UPA_SUL", "UPA Zona Sul",                   "UPA",       "localhost", 9101, 3);
-
-        for (int i = 0; i < DISPATCH_POOL; i++) {
-            dispatchPool.submit(TCPService::dispatchLoop);
-        }
-
-        startClientServer();
-        startHeartbeatReceiver();
-    }
 
     // ---------------------------------------------------------------
     // Servidor de clientes
     // ---------------------------------------------------------------
     private static void startClientServer() {
-        try (ServerSocket server = new ServerSocket(CLIENT_PORT)) {
+        try (ServerSocket server = new ServerSocket(CLIENT_PORT)) {  // abre a porta e fica escutando
             server.setReuseAddress(true);
             log("Servidor central iniciado na porta " + CLIENT_PORT);
             log("Distribuição por prioridade ativa | Aging: " + AGING_THRESHOLD_MS + "ms");
 
             while (true) {
-                Socket clientSocket = server.accept();
-                clientPool.submit(() -> handleClient(clientSocket));
+                Socket clientSocket = server.accept(); // bloqueia até um cliente conectar → retorna Socket
+                clientPool.submit(() -> handleClient(clientSocket)); // delega o atendimento a uma thread do pool
             }
 
         } catch (IOException e) {
@@ -108,27 +86,30 @@ public class TCPService {
         }
     }
 
+    //Recebe um socket cliente
     private static void handleClient(Socket clientSocket) {
-        String clientAddr = clientSocket.getInetAddress().getHostAddress();
+        String clientAddr = clientSocket.getInetAddress().getHostAddress(); //pega o endereço de host do cliente
         log("Cliente conectado: " + clientAddr);
 
         try (
-            ObjectInputStream  in  = new ObjectInputStream(clientSocket.getInputStream());
-            ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream())
+            ObjectInputStream  in  = new ObjectInputStream(clientSocket.getInputStream()); //instancia um objeto recuperando-o do stream
+            ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream()) //escreve um objeto no stream
         ) {
-            Object obj = in.readObject();
+            Object obj = in.readObject(); //espera por um retorno
 
-            if (!(obj instanceof Occurrence occurrence)) {
+            if (!(obj instanceof Occurrence occurrence)) { //verifica se o objeto recebido é um occurence, senão ele escreve no buffer um objeto inválido
                 out.writeObject("ERR:objeto inválido");
                 return;
-            }
+            } 
 
             log("Ocorrência recebida: " + occurrence);
-            db.saveOccurrence(occurrence);
-            priorityQueue.offer(occurrence);
+            db.saveOccurrence(occurrence); //salvar no banco a ocorrência
+            priorityQueue.offer(occurrence); //faz a lógica de prioridade
 
-            out.writeObject("ACK:" + occurrence.getId());
-            log("ACK enviado → " + occurrence.getId().substring(0, 8));
+            out.writeObject("ACK:" + occurrence.getId()); //serializa no stream e joga no buffer o Acknowledgement 
+            //simplemente estamos confirmando o recebimento e que o Occurence foi salvo no banco.
+            //no caso nao temos como ver, somente com wireshark e tudo mais
+            log("ACK enviado → " + occurrence.getId().substring(0, 8)); 
 
         } catch (Exception e) {
             log("ERRO ao tratar cliente " + clientAddr + ": " + e.getMessage());
@@ -342,7 +323,7 @@ public class TCPService {
         log("Nó registrado: " + node);
     }
 
-    private static void markNodeUnavailable(String nodeId) {
+    public static void markNodeUnavailable(String nodeId) {
         Node node = registeredNodes.get(nodeId);
         if (node != null) {
             node.available = false;
@@ -362,62 +343,27 @@ public class TCPService {
     }
 
     // ---------------------------------------------------------------
-    // Receptor UDP de Heartbeat (porta 9001)
-    // ---------------------------------------------------------------
-    private static void startHeartbeatReceiver() {
-        Thread udpThread = new Thread(() -> {
-            try (DatagramSocket udpSocket = new DatagramSocket(9001)) {
-                udpSocket.setReuseAddress(true);
-                log("Receptor de heartbeat UDP iniciado na porta 9001");
-
-                byte[] buffer = new byte[256];
-
-                while (!Thread.currentThread().isInterrupted()) {
-                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                    udpSocket.receive(packet);
-
-                    String message = new String(packet.getData(), 0, packet.getLength()).trim();
-                    handleHeartbeat(message, packet.getAddress().getHostAddress());
-                }
-
-            } catch (Exception e) {
-                log("ERRO no receptor UDP: " + e.getMessage());
-            }
-        }, "heartbeat-receiver");
-
-        udpThread.setDaemon(true);
-        udpThread.start();
-    }
-
-    private static void handleHeartbeat(String message, String fromIp) {
-        if (!message.startsWith("HB:")) {
-            log("Heartbeat malformado de " + fromIp + ": " + message);
-            return;
-        }
-
-        String nodeId = message.substring(3);
-        Node node = registeredNodes.get(nodeId);
-
-        if (node == null) {
-            log("Heartbeat de nó desconhecido: " + nodeId);
-            return;
-        }
-
-        db.updateHeartbeat(nodeId);
-
-        if (!node.available) {
-            markNodeAvailable(nodeId);
-            log("Nó REATIVADO via heartbeat: " + nodeId + " (" + fromIp + ")");
-        } else {
-            log("Heartbeat recebido de " + nodeId + " (" + fromIp + ")");
-        }
-    }
-
-    // ---------------------------------------------------------------
     // Log
     // ---------------------------------------------------------------
     private static void log(String msg) {
         System.out.printf("[SERVIDOR %s] %s%n",
                 new Timestamp(System.currentTimeMillis()), msg);
+    }
+
+
+
+    public static void main(String[] args) {
+        db = new DatabaseManager();
+
+        registerNode("SAMU_1",  "Ambulância SAMU 1 – UTI Móvel", "AMBULANCE", "localhost", 9100, 1);
+        registerNode("SAMU_2",  "Ambulância SAMU 2",              "AMBULANCE", "localhost", 9102, 2);
+        registerNode("UPA_SUL", "UPA Zona Sul",                   "UPA",       "localhost", 9101, 3);
+
+        for (int i = 0; i < DISPATCH_POOL; i++) {
+            dispatchPool.submit(TCPService::dispatchLoop);
+        }
+
+        new Heartbeat(registeredNodes, db).start(); // sobe antes — thread daemon, não bloqueia
+        startClientServer();                         // bloqueia aqui, por isso fica por último
     }
 }

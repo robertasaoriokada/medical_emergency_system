@@ -3,6 +3,27 @@
   "configurations": [
     {
       "type": "java",
+      "name": "PeakLoadTest",
+      "request": "launch",
+      "mainClass": "com.example.test.PeakLoadTest",
+      "projectName": "demo"
+    },
+    {
+      "type": "java",
+      "name": "NodeFailureTest",
+      "request": "launch",
+      "mainClass": "com.example.test.NodeFailureTest",
+      "projectName": "demo"
+    },
+    {
+      "type": "java",
+      "name": "AgingPriorityTest",
+      "request": "launch",
+      "mainClass": "com.example.test.AgingPriorityTest",
+      "projectName": "demo"
+    },
+    {
+      "type": "java",
       "name": "AttendanceNode",
       "request": "launch",
       "mainClass": "com.example.services.AttendanceNode",

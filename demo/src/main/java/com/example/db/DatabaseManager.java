@@ -7,44 +7,7 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 
 import com.example.model.Occurrence;
-import com.example.model.Occurrence.Color;
 
-/**
- * Gerenciador de persistência — wraps a conexão JDBC e expõe
- * operações de domínio para o sistema de emergência.
- *
- * Schema esperado (MySQL):
- *
- *   CREATE TABLE occurrences (
- *     id           VARCHAR(36)  PRIMARY KEY,
- *     origin       VARCHAR(20)  NOT NULL,
- *     type         VARCHAR(30)  NOT NULL,
- *     priority     INT          NOT NULL,
- *     color        VARCHAR(15)  NOT NULL,
- *     description  TEXT,
- *     created_at   TIMESTAMP    NOT NULL,
- *     received_at  TIMESTAMP    NOT NULL,
- *     status       VARCHAR(20)  NOT NULL DEFAULT 'PENDING'
- *   );
- *
- *   CREATE TABLE attendance_nodes (
- *     id             VARCHAR(20)  PRIMARY KEY,
- *     name           VARCHAR(50)  NOT NULL,
- *     type           VARCHAR(20)  NOT NULL,
- *     status         VARCHAR(20)  NOT NULL DEFAULT 'AVAILABLE',
- *     last_heartbeat TIMESTAMP    NOT NULL
- *   );
- *
- *   CREATE TABLE metrics (
- *     id               BIGINT AUTO_INCREMENT PRIMARY KEY,
- *     occurrence_id    VARCHAR(36)  NOT NULL,
- *     node_id          VARCHAR(20)  NOT NULL,
- *     dispatched_at    TIMESTAMP    NOT NULL,
- *     ack_at           TIMESTAMP,
- *     response_time_ms BIGINT,
- *     retries          INT          NOT NULL DEFAULT 0
- *   );
- */
 public class DatabaseManager {
 
     private static final String URL  = "jdbc:mysql://localhost:3306/emergency_db"
@@ -71,7 +34,6 @@ public class DatabaseManager {
         }
     }
 
-    /** Verifica conexão e reconecta se necessário (para processos de longa duração) */
     private Connection getConn() throws SQLException {
         if (conn == null || conn.isClosed()) {
             System.out.println("[DB] Reconectando...");
@@ -85,52 +47,24 @@ public class DatabaseManager {
     // ---------------------------------------------------------------
 
     /**
-     * Persiste uma ocorrência completa a partir do objeto de domínio.
-     * Usa createdAt e receivedAt vindos diretamente do modelo.
+     * Persiste uma ocorrência nova.
+     * Colunas conforme o script: id, origin, type, priority, color,
+     * description, received_at. Status fica como DEFAULT 'PENDING'.
      */
     public void saveOccurrence(Occurrence occ) {
         String sql = """
             INSERT INTO occurrences
-              (id, origin, type, priority, color, description, created_at, received_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+              (id, origin, type, priority, color, description, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """;
         try (PreparedStatement ps = getConn().prepareStatement(sql)) {
-            ps.setString(1, occ.getId());
-            ps.setString(2, occ.getOrigin());
-            ps.setString(3, occ.getType().name());       // enum → String
-            ps.setInt   (4, occ.getPriority());
-            ps.setString(5, occ.getColor().name());      // enum → String
-            ps.setString(6, occ.getDescription());
-            ps.setTimestamp(7, occ.getCreatedAt());
-            ps.setTimestamp(8, occ.getReceivedAt());
-            ps.executeUpdate();
-        } catch (SQLException e) {
-            System.err.println("[DB] ERRO saveOccurrence: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Sobrecarga para quando os campos chegam individualmente
-     * (ex: chamada vinda de outro sistema sem objeto Occurrence).
-     */
-    public void saveOccurrence(String id, String origin, String type,
-                               int priority, Color color,
-                               String description,
-                               Timestamp createdAt, Timestamp receivedAt) {
-        String sql = """
-            INSERT INTO occurrences
-              (id, origin, type, priority, color, description, created_at, received_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-            """;
-        try (PreparedStatement ps = getConn().prepareStatement(sql)) {
-            ps.setString   (1, id);
-            ps.setString   (2, origin);
-            ps.setString   (3, type);
-            ps.setInt      (4, priority);
-            ps.setString   (5, color.name());
-            ps.setString   (6, description);
-            ps.setTimestamp(7, createdAt);
-            ps.setTimestamp(8, receivedAt);
+            ps.setString   (1, occ.getId());
+            ps.setString   (2, occ.getOrigin());
+            ps.setString   (3, occ.getType().name());
+            ps.setInt      (4, occ.getPriority());
+            ps.setString   (5, occ.getColor().name());
+            ps.setString   (6, occ.getDescription());
+            ps.setTimestamp(7, occ.getReceivedAt());
             ps.executeUpdate();
         } catch (SQLException e) {
             System.err.println("[DB] ERRO saveOccurrence: " + e.getMessage());
@@ -190,13 +124,19 @@ public class DatabaseManager {
     // ---------------------------------------------------------------
     // Métricas
     // ---------------------------------------------------------------
+
+    /**
+     * Salva métrica de despacho.
+     * completed_at fica NULL por enquanto — pode ser atualizado
+     * quando o nó finalizar o atendimento futuramente.
+     */
     public void saveMetric(String occurrenceId, String nodeId,
                             Timestamp dispatchedAt, Timestamp ackAt,
                             long responseTimeMs, int retries) {
         String sql = """
             INSERT INTO metrics
-              (occurrence_id, node_id, dispatched_at, ack_at, response_time_ms, retries)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (occurrence_id, node_id, dispatched_at, ack_at, completed_at, response_time_ms, retries)
+            VALUES (?, ?, ?, ?, NULL, ?, ?)
             """;
         try (PreparedStatement ps = getConn().prepareStatement(sql)) {
             ps.setString   (1, occurrenceId);
