@@ -35,6 +35,8 @@ public class AttendanceNode {
     private volatile boolean running = true;
 
     private final ExecutorService threadPool;
+    private final HeartbeatSender heartbeatSender;
+
 
     public AttendanceNode(String nodeId, String name, String type, int port) {
         this.nodeId     = nodeId;
@@ -46,6 +48,8 @@ public class AttendanceNode {
             t.setDaemon(true);
             return t;
         });
+        this.heartbeatSender = new HeartbeatSender(nodeId, CENTRAL_HOST, 9001);
+
     }
 
     // ---------------------------------------------------------------
@@ -53,7 +57,7 @@ public class AttendanceNode {
     // ---------------------------------------------------------------
     public void start() {
         registerWithCentral();
-        startHeartbeat();
+        heartbeatSender.start();
         listenForDispatches();
     }
 
@@ -65,40 +69,6 @@ public class AttendanceNode {
         // mas em uma arquitetura real o nó se auto-registraria via
         // mensagem de controle. Logamos apenas para visibilidade.
         log("Nó inicializado — aguardando despachos na porta " + port);
-    }
-
-    // ---------------------------------------------------------------
-    // Heartbeat periódico → servidor central (UDP 9001)
-    // ---------------------------------------------------------------
-    private void startHeartbeat() {
-        Thread hb = new Thread(() -> {
-            try (DatagramSocket udpSocket = new DatagramSocket()) {
-                while (running && !Thread.currentThread().isInterrupted()) {
-                    sendHeartbeat(udpSocket);
-                    Thread.sleep(5_000); // a cada 5 segundos
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (Exception e) {
-                log("ERRO no heartbeat: " + e.getMessage());
-            }
-        }, nodeId + "-heartbeat");
-        hb.setDaemon(true);
-        hb.start();
-        log("Heartbeat UDP iniciado → " + CENTRAL_HOST + ":9001");
-    }
-
-    private void sendHeartbeat(DatagramSocket udpSocket) {
-        try {
-            String payload = "HB:" + nodeId;
-            byte[] data    = payload.getBytes();
-            InetAddress addr = InetAddress.getByName(CENTRAL_HOST);
-            DatagramPacket packet = new DatagramPacket(data, data.length, addr, 9001);
-            udpSocket.send(packet);
-            log("Heartbeat enviado");
-        } catch (Exception e) {
-            log("ERRO ao enviar heartbeat: " + e.getMessage());
-        }
     }
 
     // ---------------------------------------------------------------
@@ -186,6 +156,7 @@ public class AttendanceNode {
     // ---------------------------------------------------------------
     public void stop() {
         running = false;
+        heartbeatSender.stop(); // para o envio de heartbeats junto com o nó
         threadPool.shutdownNow();
         log("Nó encerrado.");
     }
